@@ -50,7 +50,7 @@ func DefaultOptions() Options {
 	options := Options{
 		Separator: "_",
 		Map: MapOptions{
-			KeyPattern:        "([A-Z0-9]+(?:_[A-Z0-9]+)*?)",
+			KeyPattern:        "((?:.)+)",
 			EntrySeparator:    ",",
 			KeyValueSeparator: ":",
 		},
