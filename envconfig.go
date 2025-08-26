@@ -6,6 +6,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -119,12 +120,32 @@ func (o Options) collectVariables(spec reflect.Type) ([]Variable[string], []Vari
 	variables := make([]Variable[string], 0)
 	templates := make([]Variable[*regexp.Regexp], 0)
 
-	o.analyze(spec, func(name string, template bool, setter setterFunc) {
+	o.analyze(spec, func(setter setterFunc, fragments ...fragment) {
 		if o.Prefix != "" {
-			name = o.Prefix + o.Separator + name
+			fragments = append(fragments, fragment{o.Prefix, false})
 		}
+
+		template := slices.ContainsFunc(fragments, func(f fragment) bool {
+			return f.dynamic
+		})
+
+		name := strings.Builder{}
+		for index := len(fragments) - 1; index >= 0; index-- {
+			f := fragments[index]
+			if f.dynamic {
+				name.WriteString(f.pattern)
+			} else {
+				name.WriteString(o.NameConverter(f.pattern))
+			}
+			if index > 0 {
+				name.WriteRune('_')
+			}
+		}
+
+		//fmt.Printf("Variable: %q (template: %v)\n", name.String(), template)
+
 		if template {
-			pattern := "^" + name + "$"
+			pattern := "^" + name.String() + "$"
 			if !o.MatchCase {
 				pattern = "(?i)" + pattern
 			}
@@ -134,7 +155,7 @@ func (o Options) collectVariables(spec reflect.Type) ([]Variable[string], []Vari
 			})
 		} else {
 			variables = append(variables, Variable[string]{
-				pattern: name,
+				pattern: name.String(),
 				set:     setter,
 			})
 		}
@@ -143,7 +164,12 @@ func (o Options) collectVariables(spec reflect.Type) ([]Variable[string], []Vari
 	return variables, templates
 }
 
-func (o Options) analyze(spec reflect.Type, collect func(string, bool, setterFunc)) {
+type fragment struct {
+	pattern string
+	dynamic bool
+}
+
+func (o Options) analyze(spec reflect.Type, collect func(setterFunc, ...fragment)) {
 	switch spec.Kind() {
 	case reflect.Ptr:
 		o.analyzePointer(spec, collect)
@@ -158,84 +184,79 @@ func (o Options) analyze(spec reflect.Type, collect func(string, bool, setterFun
 	}
 }
 
-func (o Options) analyzePointer(spec reflect.Type, collect func(string, bool, setterFunc)) {
-	o.analyze(spec.Elem(), func(name string, template bool, set setterFunc) {
-		collect(name, template, func(target reflect.Value, tokens ...string) error {
+func (o Options) analyzePointer(spec reflect.Type, collect func(setterFunc, ...fragment)) {
+	o.analyze(spec.Elem(), func(set setterFunc, fragments ...fragment) {
+		setter := func(target reflect.Value, values ...string) error {
 			if target.Kind() != reflect.Ptr {
 				return fmt.Errorf("invalid type: expected %s but got %s", reflect.Ptr, target.Kind())
 			}
 			if target.IsNil() {
 				target.Set(reflect.New(target.Type().Elem()))
 			}
-			return set(target.Elem(), tokens...)
-		})
+			return set(target.Elem(), values...)
+		}
+
+		collect(setter, fragments...)
 	})
 }
 
-func (o Options) analyzeStruct(spec reflect.Type, collect func(string, bool, setterFunc)) {
+func (o Options) analyzeStruct(spec reflect.Type, collect func(setterFunc, ...fragment)) {
 	for i := 0; i < spec.NumField(); i++ {
 		index := i
 		field := spec.Field(index)
 
-		fieldAlias := field.Tag.Get("envconfig")
-		if fieldAlias == "" && o.NameConverter != nil {
-			fieldAlias = o.NameConverter(field.Name)
-		}
-
-		fieldName := field.Name
-		if fieldAlias != "" {
-			fieldName = fieldAlias
-		}
-
 		if field.IsExported() {
 			if isPrimitive(field.Type) {
-				collect(fieldName, false, func(target reflect.Value, tokens ...string) error {
-					return setPrimitive(target.Field(index), tokens[0])
-				})
+				setter := func(target reflect.Value, values ...string) error {
+					return setPrimitive(target.Field(index), values[0])
+				}
+				collect(setter, fragment{field.Name, false})
 			} else {
-				if isPrimitiveSlice(field.Type) {
-					collect(fieldName, false, func(target reflect.Value, tokens ...string) error {
-						return o.setPrimitiveSlice(field.Type, target.Field(index), tokens[0])
-					})
-				}
-
 				if isPrimitiveMap(field.Type) {
-					collect(fieldName, false, func(target reflect.Value, tokens ...string) error {
-						return o.setPrimitiveMap(field.Type, target.Field(index), tokens[0])
-					})
+					setter := func(target reflect.Value, values ...string) error {
+						return o.setPrimitiveMap(field.Type, target.Field(index), values[0])
+					}
+					collect(setter, fragment{field.Name, false})
 				}
 
-				o.analyze(field.Type, func(name string, template bool, set setterFunc) {
-					setter := func(target reflect.Value, tokens ...string) error {
-						return set(target.Field(index), tokens...)
+				if isPrimitiveSlice(field.Type) {
+					setter := func(target reflect.Value, values ...string) error {
+						return o.setPrimitiveSlice(field.Type, target.Field(index), values[0])
+					}
+					collect(setter, fragment{field.Name, false})
+				}
+
+				o.analyze(field.Type, func(set setterFunc, fragments ...fragment) {
+					setter := func(target reflect.Value, values ...string) error {
+						return set(target.Field(index), values...)
 					}
 					if field.Anonymous {
-						collect(name, template, setter)
+						collect(setter, fragments...)
 					}
-					collect(fmt.Sprint(fieldName, o.Separator, name), template, setter)
+					collect(setter, append(fragments, fragment{field.Name, false})...)
 				})
 			}
 		}
 	}
 }
 
-func (o Options) analyzeMap(spec reflect.Type, collect func(string, bool, setterFunc)) {
+func (o Options) analyzeMap(spec reflect.Type, collect func(setterFunc, ...fragment)) {
 	keySpec := spec.Key()
 	valueSpec := spec.Elem()
 	if isPrimitive(keySpec) {
-		_collect := func(name string, set setterFunc) {
-			collect(name, true, func(target reflect.Value, tokens ...string) error {
+		_collect := func(set setterFunc, fragments ...fragment) {
+			setter := func(target reflect.Value, values ...string) error {
 				if target.Kind() != reflect.Map {
 					return fmt.Errorf("invalid type: expected %s but got %s", reflect.Map, target.Kind())
 				}
 
-				key := reflect.New(keySpec).Elem()
-				if err := setPrimitive(key, tokens[0]); err != nil {
+				keyElem := reflect.New(keySpec).Elem()
+				if err := setPrimitive(keyElem, values[0]); err != nil {
 					return err
 				}
 
-				value := reflect.New(valueSpec).Elem()
-				if err := set(value, tokens[1:]...); err != nil {
+				valueElem := reflect.New(valueSpec).Elem()
+				if err := set(valueElem, values[1:]...); err != nil {
 					return err
 				}
 
@@ -243,33 +264,35 @@ func (o Options) analyzeMap(spec reflect.Type, collect func(string, bool, setter
 					target.Set(reflect.MakeMap(target.Type()))
 				}
 
-				target.SetMapIndex(key, value)
+				target.SetMapIndex(keyElem, valueElem)
 
 				return nil
-			})
+			}
+			collect(setter, fragments...)
 		}
 
 		if isPrimitive(valueSpec) {
-			_collect(o.Map.KeyPattern, func(target reflect.Value, tokens ...string) error {
-				return setPrimitive(target, tokens[0])
-			})
+			setter := func(target reflect.Value, values ...string) error {
+				return setPrimitive(target, values[0])
+			}
+			_collect(setter, fragment{o.Map.KeyPattern, true})
 		} else {
-			o.analyze(valueSpec, func(name string, pattern bool, setter setterFunc) {
-				_collect(fmt.Sprint(o.Map.KeyPattern, o.Separator, name), setter)
+			o.analyze(valueSpec, func(setter setterFunc, fragments ...fragment) {
+				_collect(setter, append(fragments, fragment{o.Map.KeyPattern, true})...)
 			})
 		}
 	}
 }
 
-func (o Options) analyzeSlice(spec reflect.Type, collect func(string, bool, setterFunc)) {
+func (o Options) analyzeSlice(spec reflect.Type, collect func(setterFunc, ...fragment)) {
 	elementSpec := spec.Elem()
-	_collect := func(name string, set setterFunc) {
-		collect(name, true, func(target reflect.Value, tokens ...string) error {
+	_collect := func(set setterFunc, fragments ...fragment) {
+		setter := func(target reflect.Value, values ...string) error {
 			if target.Kind() != reflect.Slice {
 				return fmt.Errorf("invalid type: expected %s but got %s", reflect.Slice, target.Kind())
 			}
 
-			index, err := strconv.Atoi(tokens[0])
+			index, err := strconv.Atoi(values[0])
 			if err != nil {
 				return err
 			}
@@ -293,21 +316,23 @@ func (o Options) analyzeSlice(spec reflect.Type, collect func(string, bool, sett
 
 			element := target.Index(index - o.Slice.FirstIndex)
 
-			if err := set(element, tokens[1:]...); err != nil {
+			if err := set(element, values[1:]...); err != nil {
 				return err
 			}
 
 			return nil
-		})
+		}
+		collect(setter, fragments...)
 	}
 
 	if isPrimitive(elementSpec) {
-		_collect(o.Slice.IndexPattern, func(target reflect.Value, tokens ...string) error {
-			return setPrimitive(target, tokens[0])
-		})
+		setter := func(target reflect.Value, values ...string) error {
+			return setPrimitive(target, values[0])
+		}
+		_collect(setter, fragment{o.Slice.IndexPattern, true})
 	} else {
-		o.analyze(elementSpec, func(name string, pattern bool, setter setterFunc) {
-			_collect(fmt.Sprint(o.Slice.IndexPattern, o.Separator, name), setter)
+		o.analyze(elementSpec, func(setter setterFunc, fragments ...fragment) {
+			_collect(setter, append(fragments, fragment{o.Slice.IndexPattern, true})...)
 		})
 	}
 }
