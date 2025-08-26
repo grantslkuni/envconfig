@@ -6,7 +6,6 @@ import (
 	"os"
 	"reflect"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 )
@@ -125,27 +124,26 @@ func (o Options) collectVariables(spec reflect.Type) ([]Variable[string], []Vari
 			fragments = append(fragments, fragment{o.Prefix, false})
 		}
 
-		template := slices.ContainsFunc(fragments, func(f fragment) bool {
-			return f.dynamic
-		})
+		dynamic := false
+		builder := strings.Builder{}
 
-		name := strings.Builder{}
-		for index := len(fragments) - 1; index >= 0; index-- {
-			f := fragments[index]
+		for i := len(fragments) - 1; i >= 0; i-- {
+			f := fragments[i]
 			if f.dynamic {
-				name.WriteString(f.pattern)
+				dynamic = true
+				builder.WriteString(f.pattern)
 			} else {
-				name.WriteString(o.NameConverter(f.pattern))
+				builder.WriteString(o.NameConverter(f.pattern))
 			}
-			if index > 0 {
-				name.WriteRune('_')
+			if i > 0 {
+				builder.WriteRune('_')
 			}
 		}
 
-		//fmt.Printf("Variable: %q (template: %v)\n", name.String(), template)
+		fmt.Printf("Variable: %q (dynamic: %v)\n", builder.String(), dynamic)
 
-		if template {
-			pattern := "^" + name.String() + "$"
+		if dynamic {
+			pattern := "^" + builder.String() + "$"
 			if !o.MatchCase {
 				pattern = "(?i)" + pattern
 			}
@@ -155,7 +153,7 @@ func (o Options) collectVariables(spec reflect.Type) ([]Variable[string], []Vari
 			})
 		} else {
 			variables = append(variables, Variable[string]{
-				pattern: name.String(),
+				pattern: builder.String(),
 				set:     setter,
 			})
 		}
