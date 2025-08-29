@@ -14,6 +14,8 @@ var ErrInvalidSpecification = errors.New("specification must be a struct pointer
 
 type setterFunc func(target reflect.Value, tokens ...string) error
 
+var camelCase = regexp.MustCompile("[A-Z][^A-Z]*")
+
 type Variable[PATTERN any] struct {
 	pattern PATTERN
 	set     setterFunc
@@ -25,13 +27,12 @@ func (v Variable[PATTERN]) String() string {
 
 type Options struct {
 	Prefix    string
-	Separator string
 	MatchCase bool
 
 	Map   MapOptions
 	Slice SliceOptions
 
-	NameConverter func(name string) string
+	Formatters []Formatter
 }
 
 type MapOptions struct {
@@ -46,11 +47,19 @@ type SliceOptions struct {
 	FirstIndex       int
 }
 
+type SplitFunction func(string) []string
+
+type JoinFunction func([]string) string
+
+type Formatter struct {
+	Split SplitFunction
+	Join  JoinFunction
+}
+
 func DefaultOptions() Options {
-	options := Options{
-		Separator: "_",
+	return Options{
 		Map: MapOptions{
-			KeyPattern:        "((?:.)+)",
+			KeyPattern:        "(.+)",
 			EntrySeparator:    ",",
 			KeyValueSeparator: ":",
 		},
@@ -58,11 +67,25 @@ func DefaultOptions() Options {
 			IndexPattern:     "([0-9]+)",
 			ElementSeparator: ",",
 		},
+		Formatters: []Formatter{
+			{
+				Split: func(name string) []string {
+					return []string{name}
+				},
+				Join: func(names []string) string {
+					return strings.Join(names, "_")
+				},
+			},
+			{
+				Split: func(name string) []string {
+					return camelCase.FindAllString(name, -1)
+				},
+				Join: func(names []string) string {
+					return strings.ToUpper(strings.Join(names, "_"))
+				},
+			},
+		},
 	}
-
-	options.NameConverter = options.ConvertFieldName
-
-	return options
 }
 
 func Init(spec any) error {
@@ -124,42 +147,47 @@ func (o Options) collectVariables(spec reflect.Type) ([]Variable[string], []Vari
 			fragments = append(fragments, fragment{o.Prefix, false})
 		}
 
-		dynamic := false
-		builder := strings.Builder{}
+		for _, formatter := range o.Formatters {
+			pattern, dynamic := format(formatter, fragments)
+			//fmt.Printf("Variable: %q (dynamic: %v)\n", name, dynamic)
 
-		for i := len(fragments) - 1; i >= 0; i-- {
-			f := fragments[i]
-			if f.dynamic {
-				dynamic = true
-				builder.WriteString(f.pattern)
+			if dynamic {
+				pattern = "^" + pattern + "$"
+				if !o.MatchCase {
+					pattern = "(?i)" + pattern
+				}
+				templates = append(templates, Variable[*regexp.Regexp]{
+					pattern: regexp.MustCompile(pattern),
+					set:     setter,
+				})
 			} else {
-				builder.WriteString(o.NameConverter(f.pattern))
-			}
-			if i > 0 {
-				builder.WriteRune('_')
+				variables = append(variables, Variable[string]{
+					pattern: pattern,
+					set:     setter,
+				})
 			}
 		}
 
-		fmt.Printf("Variable: %q (dynamic: %v)\n", builder.String(), dynamic)
-
-		if dynamic {
-			pattern := "^" + builder.String() + "$"
-			if !o.MatchCase {
-				pattern = "(?i)" + pattern
-			}
-			templates = append(templates, Variable[*regexp.Regexp]{
-				pattern: regexp.MustCompile(pattern),
-				set:     setter,
-			})
-		} else {
-			variables = append(variables, Variable[string]{
-				pattern: builder.String(),
-				set:     setter,
-			})
-		}
 	})
 
 	return variables, templates
+}
+
+func format(formatter Formatter, fragments []fragment) (string, bool) {
+	tokens := make([]string, 0)
+	dynamic := false
+
+	for i := len(fragments) - 1; i >= 0; i-- {
+		f := fragments[i]
+		if f.dynamic {
+			dynamic = true
+			tokens = append(tokens, f.pattern)
+		} else {
+			tokens = append(tokens, formatter.Split(f.pattern)...)
+		}
+	}
+
+	return formatter.Join(tokens), dynamic
 }
 
 type fragment struct {
@@ -443,20 +471,4 @@ func (o Options) setPrimitiveSlice(spec reflect.Type, target reflect.Value, toke
 	}
 
 	return nil
-}
-
-var wordPattern = regexp.MustCompile("[A-Z][^A-Z]*")
-
-func (o Options) ConvertFieldName(name string) string {
-	words := wordPattern.FindAllString(name, -1)
-	result := strings.Builder{}
-
-	for i, word := range words {
-		if i > 0 {
-			result.WriteString(o.Separator)
-		}
-		result.WriteString(strings.ToUpper(word))
-	}
-
-	return result.String()
 }
